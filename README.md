@@ -3,7 +3,7 @@ Utilities for auto trip capture using GPS logger, data prep, Spark processing, M
 
 ## trip_prep.py
 
-`
+```
 usage: trip_prep.py [-h] [-v] [-r] [-a] [-k] -i IN [-o OUTDIR]
 
 Prepare raw GPS data files
@@ -17,5 +17,5 @@ optional arguments:
   -i IN, --in IN        Input file or directory
   -o OUTDIR, --outdir OUTDIR
                         Place cleaned-up file(s) in this directory
-`
+```
 
