@@ -35,4 +35,3 @@ optional arguments:
   -i IMAGE, --image IMAGE
                         Directory to store images
 ```
-```
