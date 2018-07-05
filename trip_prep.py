@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# TODO relative heading, trip summaries, KMpH option.
+# TODO HDF5 output option.
 # TODO switch to pandas.
 
 import argparse
@@ -8,10 +8,11 @@ import csv
 import h5py
 import math
 import os
-import requests
-import string
 import sys
 import time
+
+from datetime import datetime
+import numpy as np
 
 MIN_SATS = 4
 '''
@@ -46,6 +47,10 @@ As each row is read, if the timestamp is different- store the lat/lng,
 # We'll use this as a good enough approximation anywhere in North America.
 deg2miles = 53.06
 deg2km = 85.39
+
+# Offset in seconds to GMT
+dt = datetime(1970,1,1,0,0,0)
+zuluoffset = time.mktime(dt.utctimetuple())
 
 
 def simple_distance(lat1,lng1, lat2,lng2):
@@ -86,13 +91,16 @@ def bearing(lat1,lng1, lat2,lng2):
   return brng
 
 
-def procFile(finame, absolute, outdir, kmph, verbose):
+def procFile(finame, outdir, absolute, kmph, verbose):
   '''
   Process a single CSV file.
   '''
 
   total_pois, total_readings, total_distance, total_time = 0, 0, 0., 0.
-  bear = 0.0
+  bear, bear_last = 0, 0
+  ts, ts_last = 0, 0
+  speed_cumul = 0.0
+  speed_peak = 0.0
 
   foname = os.path.abspath(os.path.join(outdir,os.path.basename(finame)))
   finame = os.path.abspath(finame)
@@ -117,68 +125,115 @@ def procFile(finame, absolute, outdir, kmph, verbose):
       else:
         beginning = False
 
-      if first_row:
-        last_row = row
-        first_row = False
+      lat2, lng2 = float( row['Lat'] ), float( row['Lng'] )
 
-      if row['TimeStamp'] == last_row['TimeStamp']:
+      d = row['TimeStamp'].rstrip('Z')
+      d,t = d.split('T')
+      d = d.split('-')
+      t = t.split(':')
+      t[2] = t[2].split('.')[0]
+      d = map(int, d)
+      t = map(int, t)
+      dt = datetime(d[0],d[1],d[2],t[0],t[1],t[2])
+      ts = int(time.mktime(dt.utctimetuple()) - zuluoffset)
+
+      if first_row:
+        first_row = False
+        row_last = row
+        ts_last = ts
+        dist = 0 
+        bear = 0
+        lat1, lng1 = lat2, lng2
+      else:
+        # Calculate distance in degrees.
+        dist_deg = simple_distance(lat1,lng1, lat2,lng2)
+        # Calculate absolute heading.
+        bear = bearing(lat1,lng1, lat2,lng2)
+
+      if ts == ts_last:
         continue
 
-      lat1, lng1 = float( last_row['Lat'] ), float( last_row['Lng'] )
-      lat2, lng2 = float( row['Lat'] ), float( row['Lng'] )
+      row['TimeStamp'] = str(ts)
 
       # Calculate distance.
       if kmph:
-        dist =    deg2km * simple_distance(lat1,lng1, lat2,lng2)
+        dist =    deg2km * dist_deg
       else:
-        dist = deg2miles * simple_distance(lat1,lng1, lat2,lng2)
-      # Calculate heading; relative or absolute.
+        dist = deg2miles * dist_deg
+
       if absolute:
-        bear = bearing(lat1,lng1, lat2,lng2)
+        row['Bearing'] = bear
       else:
-        pass
+        row['Bearing'] = bear - bear_last # TODO handle wraparound
 
       # Calculate speed.
-      row['Speed'] =  dist * 3600.0  # 
-      row['Bearing'] = bear
+      numsecs = ts - ts_last  # Can't assume 1/row, can loose rows going through tunnel.
 
+      speed =  dist * 3600.0 / numsecs  # 
+      row['Speed'] =  speed
+      speed_cumul += speed
+      if speed > speed_peak:
+        speed_peak = speed
+
+      total_time = total_time + numsecs
+      total_distance = total_distance + dist
       total_readings = total_readings + 1
       poi = row['POI'] is not None and len(row['POI']) > 0
       if poi:
         total_pois = total_pois + 1
 
-      if dist != 0.0 or poi:
-        focsv.writerow(row)
+      # if dist != 0.0 or poi:
+      # Store the timestamp, lat/lng, # satellites, speed, bearing.
+      focsv.writerow(row)
 
-      last_row = row
-    # Store the timestamp, lat/lng, # satellites, distance, bearing.
+      row_last = row
+      ts_last = ts
+      bear_last = bear
+      lat1, lng1 = lat2, lng2
+
     focsv.writerow(row)
 
+    speed_avg = speed_cumul / total_readings
+
   if verbose:
-    # Summary: Trip duration, avg speed, peak speed.
-    pass
+    # Summary: Trip duration, total distance traversed, avg speed, peak speed.
+    if kmph:
+      summary = "Total distance covered: {:.2f} kilometers; in {:.2f} hours\n" + \
+              "Average speed: {:5.2f} kmph\n" + \
+              "Peak    speed: {:5.2f} kmph\n" + \
+                "Total Valid Readings: {:}\n" + \
+                "Total POIs: {:,}"
+    else:
+      summary = "Total distance covered: {:.2f} miles; in {:.2f} hours\n" + \
+              "Average speed: {:5.2f} mph\n" + \
+              "Peak    speed: {:5.2f} mph\n" + \
+                "Total Valid Readings: {:}\n" + \
+                "Total POIs: {:,}"
+    print(summary.format(total_distance, total_time/3600.0, speed_avg, speed_peak, \
+          total_readings, total_pois))
 
   return total_readings, total_pois
 
 
-def proc(path, absolute, outdir, kmph, verbose):
+def proc(path, outdir, absolute, kmph, verbose):
   '''
   Process all the CSV files found in a directory 
   or just a single file if that is what is given.
   '''
+  total_readings, total_pois = 0, 0
+
   if os.path.isfile(path):
-    total_readings, total_pois = procFile(path, absolute, outdir, kmph, verbose)
-    print("Total GPS Readings: {}. Total POIs: {}.".format(total_readings, total_pois))
-    return
+    total_readings, total_pois = procFile(path, outdir, absolute, kmph, verbose)
 
   if os.path.isdir(path):
     for root, dirs, files in os.walk(path):
       for file in files:
         if file.endswith(".csv"):
-          total_readings, total_pois = procFile(os.path.join(root, file), absolute, outdir, kmph, verbose)
-          print("Total GPS Readings: {}. Total POIs: {}.".format(total_readings, total_pois))
-    return
-  return
+          readings, pois = procFile(os.path.join(root, file), outdir, absolute, kmph, verbose)
+          total_readings += readings
+          total_pois     += pois
+
+  return total_readings, total_pois
 
 
 if __name__ == "__main__":
@@ -187,18 +242,28 @@ if __name__ == "__main__":
   parser.add_argument('-v','--verbose', help='Will give summary at end', action='store_true')
   parser.add_argument('-r','--relative', help='Calculate relative heading in degrees', action='store_false')
   parser.add_argument('-a','--absolute', help='Calculate absolute heading in degrees; default', action='store_true')
-  parser.add_argument('-k','--kmph', help='Calculates speed in KM/Hour. Default is MPH', action='store_false')
+  parser.add_argument('-k','--kmph', help='Calculates speed in KM/Hour. Default is MPH', action='store_true')
   parser.add_argument('-i','--in', help='Input file or directory', required=True)
   parser.add_argument('-o','--outdir', help='Place cleaned-up file(s) in this directory',
                                        required=False, default=os.getcwd())
   args = vars(parser.parse_args())
 
   absolute = args['absolute']
-  if not ( absolute is not args['relative'] ):
+  if absolute is args['relative']:
     print("Must pick either absolute or relative.")
     sys.exit(1)
 
   absolute = False if args['relative'] is True else True # absolute is default.
 
-  proc( args['in'], absolute, args['outdir'], args['verbose'], args['kmph'] )
+  outdir = args['outdir']
+  if not os.path.isdir(outdir):
+    print("Specified output directory does not exist.")
+    sys.exit(1)
+  inpath = args['in']
+  if not os.path.exists(inpath):
+    print("Specified input path does not exist.")
+    sys.exit(1)
 
+  total_readings,total_pois = proc(inpath, outdir, absolute, args['kmph'], args['verbose'])
+
+  print("Total GPS Readings: {:,}. Total POIs: {}.".format(total_readings, total_pois))
